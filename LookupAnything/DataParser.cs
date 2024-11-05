@@ -497,7 +497,8 @@ internal class DataParser
                             continue;
 
                         // track whether some recipes are too complex to fully display
-                        if (outputItem.OutputMethod != null) {
+                        if (outputItem.OutputMethod != null)
+                        {
                             someRulesTooComplex = true;
                             continue;
                         }
