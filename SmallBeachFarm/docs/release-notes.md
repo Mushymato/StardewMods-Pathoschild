@@ -1,6 +1,16 @@
 ﻿[← back to readme](README.md)
 
 # Release notes
+## 2.5.10
+Released 10 November 2024 for SMAPI 4.1.2 or later.
+
+* Fixed logged errors in versions 2.5.8+ while on the farm in summer, fall, or winter.
+
+## 2.5.9
+Released 04 November 2024 for SMAPI 4.1.2 or later.
+
+* Fixed the previous update being broken on Linux/macOS.
+
 ## 2.5.8
 Released 04 November 2024 for SMAPI 4.1.0 or later.
 

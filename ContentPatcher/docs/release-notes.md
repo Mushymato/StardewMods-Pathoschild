@@ -9,6 +9,28 @@ When releasing a format change, don't forget to update the smapi.io/json schema!
 
 
 -->
+## 2.4.4
+Released 08 November 2024 for SMAPI 4.1.5 or later.
+
+* In SMAPI 4.1._x_, [gender-switch blocks](https://stardewvalleywiki.com/Modding:Dialogue#Gender_switch) are preprocessed automatically by default. That no longer applies to the `{{i18n}}` token.  
+  _That didn't work with [patch update rates](author-guide.md#update-rate), and gender-switch blocks still work fine for translations passed to the game since they'll be parsed by the game._
+* Fixed `{{i18n}}` making text lowercase if the entire text matches a special case like `true` or `false`.
+
+## 2.4.3
+Released 07 November 2024 for SMAPI 4.1.5 or later.
+
+* Fixed `i18n` tokens containing gender-switch blocks not updating when the gender changes.
+
+## 2.4.2
+Released 05 November 2024 for SMAPI 4.1.4 or later.
+
+* Fixed `CustomLocations` locations not working in Stardew Valley 1.6.9+.
+
+## 2.4.1
+Released 04 November 2024 for SMAPI 4.1.2 or later.
+
+* Fixed the previous update being broken on Linux/macOS.
+
 ## 2.4.0
 Released 04 November 2024 for SMAPI 4.1.0 or later. See the [release highlights](https://www.patreon.com/posts/115260984).
 

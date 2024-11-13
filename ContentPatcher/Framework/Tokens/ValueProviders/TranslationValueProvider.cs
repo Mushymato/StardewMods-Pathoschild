@@ -38,10 +38,12 @@ internal class TranslationValueProvider : BaseValueProvider
     /// <inheritdoc />
     public override bool UpdateContext(IContext context)
     {
-        if (this.TranslationHelper.LocaleEnum == this.LastLocale)
+        LocalizedContentManager.LanguageCode curLocale = this.TranslationHelper.LocaleEnum;
+
+        if (curLocale == this.LastLocale)
             return false;
 
-        this.LastLocale = this.TranslationHelper.LocaleEnum;
+        this.LastLocale = curLocale;
         return true;
     }
 
@@ -50,20 +52,20 @@ internal class TranslationValueProvider : BaseValueProvider
     {
         this.AssertInput(input);
 
-        // get translation
+        // get key
         string? key = input.GetFirstPositionalArg();
         if (string.IsNullOrWhiteSpace(key))
             return InvariantSets.Empty;
-        Translation translation = this.TranslationHelper.Get(key);
 
-        // add tokens
-        if (input.HasNamedArgs)
-        {
-            translation = translation.Tokens(input
-                .NamedArgs
-                .ToDictionary(p => p.Key, p => this.Stringify(p.Value))
-            );
-        }
+        // get tokens
+        object? tokens = input.HasNamedArgs
+            ? input.NamedArgs.ToDictionary(p => p.Key, p => this.Stringify(p.Value))
+            : null;
+
+        // get translation
+        Translation translation = this.TranslationHelper
+            .Get(key, tokens)
+            .ApplyGenderSwitchBlocks(false); // preprocessing gender switch blocks doesn't work with patch update rates (e.g. NPCs won't update their dialogue once the save is loaded)
 
         // add default value
         if (input.NamedArgs.TryGetValue("default", out IInputArgumentValue? defaultValue))
@@ -73,7 +75,7 @@ internal class TranslationValueProvider : BaseValueProvider
                 .UsePlaceholder(false); // allow setting a blank default
         }
 
-        return InvariantSets.FromValue(translation);
+        return InvariantSets.FromCaseSensitiveValue(translation);
     }
 
 

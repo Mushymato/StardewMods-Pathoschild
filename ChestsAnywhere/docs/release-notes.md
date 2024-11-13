@@ -1,6 +1,16 @@
 ﻿[← back to readme](README.md)
 
 # Release notes
+## 1.25.2
+Released 10 November 2024 for SMAPI 4.1.2 or later.
+
+* When a custom location has a very long name, it's now truncated when used as a default chest category.
+
+## 1.25.1
+Released 04 November 2024 for SMAPI 4.1.2 or later.
+
+* Fixed the previous update being broken on Linux/macOS.
+
 ## 1.25.0
 Released 04 November 2024 for SMAPI 4.1.0 or later.
 
