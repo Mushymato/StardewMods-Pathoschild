@@ -46,6 +46,14 @@ internal class PatchLoader
     /// <summary>Handles parsing raw strings into tokens.</summary>
     private readonly Lexer Lexer = new();
 
+    /// <summary>The built-in local token names that can't be used for a user-defined local token.</summary>
+    private readonly InvariantSet ReservedLocalTokenNames = new(
+        nameof(ConditionType.FromFile),
+        nameof(ConditionType.Target),
+        nameof(ConditionType.TargetPathOnly),
+        nameof(ConditionType.TargetWithoutPath)
+    );
+
 
     /*********
     ** Public methods
@@ -68,22 +76,23 @@ internal class PatchLoader
     /// <summary>Load patches for a content pack.</summary>
     /// <param name="contentPack">The content pack for which to load patches.</param>
     /// <param name="rawPatches">The raw patches to load.</param>
+    /// <param name="inheritLocalTokens">The local token values to inherit for all loaded patches, in addition to their <see cref="PatchConfig.LocalTokens"/> field.</param>
     /// <param name="rootIndexPath">The path of indexes from the root <c>content.json</c> to the root which is loading patches; see <see cref="IPatch.IndexPath"/>.</param>
     /// <param name="path">The path to the patches from the root content file.</param>
     /// <param name="parentPatch">The parent <see cref="PatchType.Include"/> patch for which the patches are being loaded, if any.</param>
     /// <returns>Returns the patches that were loaded.</returns>
-    public IEnumerable<IPatch> LoadPatches(RawContentPack contentPack, PatchConfig[] rawPatches, int[] rootIndexPath, LogPathBuilder path, Patch? parentPatch)
+    public IEnumerable<IPatch> LoadPatches(RawContentPack contentPack, PatchConfig[] rawPatches, InvariantDictionary<IManagedTokenString>? inheritLocalTokens, int[] rootIndexPath, LogPathBuilder path, Patch? parentPatch)
     {
         bool verbose = this.Monitor.IsVerbose;
 
         // get fake patch context (so patch tokens are available in patch validation)
         ModTokenContext modContext = this.TokenManager.TrackLocalTokens(contentPack.ContentPack);
-        LocalContext fakePatchContext = new LocalContext(contentPack.Manifest.UniqueID, parentContext: modContext);
+        LocalContext validatorPatchContext = new LocalContext(contentPack.Manifest.UniqueID, parentContext: modContext);
         foreach (ConditionType type in InternalConstants.FromFileTokens.Concat(InternalConstants.TargetTokens))
-            fakePatchContext.SetLocalValue(type.ToString(), InternalConstants.TokenPlaceholder);
+            validatorPatchContext.SetLocalValue(type.ToString(), InternalConstants.TokenPlaceholder);
 
         // get token parser for fake context
-        TokenParser tokenParser = new TokenParser(fakePatchContext, contentPack.Manifest, contentPack.Migrator, this.InstalledMods);
+        TokenParser tokenParser = new TokenParser(validatorPatchContext, contentPack.Manifest, contentPack.Migrator, this.InstalledMods);
 
         // preprocess patches
         PatchConfig[] patches = this.SplitPatches(rawPatches).ToArray();
@@ -108,7 +117,7 @@ internal class PatchLoader
             var localPath = path.With(patch.LogName!);
             if (verbose)
                 this.Monitor.Log($"   loading {localPath}...");
-            IPatch? loaded = this.LoadPatch(contentPack, patch, tokenParser, rootIndexPath.Concat([index]).ToArray(), localPath, parentPatch, logSkip: reasonPhrase => this.Monitor.Log($"Ignored {localPath}: {reasonPhrase}", LogLevel.Warn));
+            IPatch? loaded = this.LoadPatch(contentPack, patch, validatorPatchContext, tokenParser, inheritLocalTokens, rootIndexPath.Concat([index]).ToArray(), localPath, parentPatch, logSkip: reasonPhrase => this.Monitor.Log($"Ignored {localPath}: {reasonPhrase}", LogLevel.Warn));
             if (loaded != null)
                 loadedPatches.Add(loaded);
         }
@@ -339,13 +348,15 @@ internal class PatchLoader
     /// <summary>Load one patch from a content pack's <c>content.json</c> file.</summary>
     /// <param name="rawContentPack">The content pack being loaded.</param>
     /// <param name="entry">The change to load.</param>
+    /// <param name="validatorPatchContext">The token context containing patch-specific tokens with placeholder values, so they're available during patch validation.</param>
     /// <param name="tokenParser">Handles low-level parsing and validation for tokens.</param>
+    /// <param name="inheritLocalTokens">The local token values to inherit for all loaded patches, in addition to their <see cref="PatchConfig.LocalTokens"/> field.</param>
     /// <param name="indexPath">The path of indexes from the root <c>content.json</c> to this patch; see <see cref="IPatch.IndexPath"/>.</param>
     /// <param name="path">The path to the patch from the root content file.</param>
     /// <param name="parentPatch">The parent <see cref="PatchType.Include"/> patch for which the patches are being loaded, if any.</param>
     /// <param name="logSkip">The callback to invoke with the error reason if loading it fails.</param>
     /// <returns>The patch that was loaded, or <c>null</c> if it failed to load.</returns>
-    private IPatch? LoadPatch(RawContentPack rawContentPack, PatchConfig entry, TokenParser tokenParser, int[] indexPath, LogPathBuilder path, Patch? parentPatch, Action<string> logSkip)
+    private IPatch? LoadPatch(RawContentPack rawContentPack, PatchConfig entry, LocalContext validatorPatchContext, TokenParser tokenParser, InvariantDictionary<IManagedTokenString>? inheritLocalTokens, int[] indexPath, LogPathBuilder path, Patch? parentPatch, Action<string> logSkip)
     {
         var pack = rawContentPack.ContentPack;
         PatchType? action = null;
@@ -373,6 +384,33 @@ internal class PatchLoader
                 action = parsedAction;
             }
 
+            // add local tokens to validator context
+            // These must be parsed later, so they can contain tokens like {{Target}} and apply the immutable required
+            // mod IDs. However, they're pre-added to the validator context here so they can still be referenced in the
+            // other fields that are parsed first.
+            //
+            // We also track non-inherited local tokens to prevent them from being used in the `FromFile` and `Target`
+            // fields, since that would lead to either circular references or complex parsing to detect them.
+            HashSet<string>? prohibitedTokensInFromFileAndTarget = null;
+            if (inheritLocalTokens?.Count > 0)
+            {
+                foreach (var token in inheritLocalTokens)
+                    validatorPatchContext.SetLocalValue(token.Key, token.Value, token.Value.IsReady);
+            }
+            if (entry.LocalTokens?.Count > 0)
+            {
+                foreach (var token in entry.LocalTokens)
+                {
+                    if (!validatorPatchContext.Contains(token.Key, enforceContext: false))
+                    {
+                        prohibitedTokensInFromFileAndTarget ??= new(StringComparer.OrdinalIgnoreCase);
+                        prohibitedTokensInFromFileAndTarget.Add(token.Key);
+                    }
+
+                    validatorPatchContext.SetLocalValue(token.Key, token.Value, ready: false);
+                }
+            }
+
             // parse conditions
             Condition[] conditions;
             IInvariantSet immutableRequiredModIDs;
@@ -389,7 +427,7 @@ internal class PatchLoader
                     if (action != PatchType.Include)
                         return TrackSkip($"must set the {nameof(PatchConfig.Target)} field");
                 }
-                else if (!tokenParser.TryParseString(entry.Target, immutableRequiredModIDs, path.With(nameof(entry.Target)), out string? error, out targetAsset))
+                else if (!tokenParser.TryParseString(entry.Target, immutableRequiredModIDs, path.With(nameof(entry.Target)), out string? error, out targetAsset, preValidate: token => this.PreValidateFromFileOrTargetToken(nameof(entry.Target), token, prohibitedTokensInFromFileAndTarget)))
                     return TrackSkip($"the {nameof(PatchConfig.Target)} is invalid: {error}");
             }
 
@@ -398,6 +436,35 @@ internal class PatchLoader
             {
                 if (entry.TargetLocale != null && !tokenParser.TryParseString(entry.TargetLocale, immutableRequiredModIDs, path.With(nameof(entry.TargetLocale)), out string? error, out targetAssetLocale))
                     return TrackSkip($"the {nameof(PatchConfig.TargetLocale)} is invalid: {error}");
+            }
+
+            // parse 'from file'
+            IManagedTokenString? fromAsset = null;
+            if (entry.FromFile != null)
+            {
+                if (!this.TryPrepareLocalAsset(entry.FromFile, tokenParser, immutableRequiredModIDs, path.With(nameof(entry.FromFile)), out string? error, out fromAsset, preValidate: token => this.PreValidateFromFileOrTargetToken(nameof(entry.Target), token, prohibitedTokensInFromFileAndTarget)))
+                    return TrackSkip(error);
+            }
+
+            // parse local tokens
+            InvariantDictionary<IManagedTokenString>? localTokens = null;
+            if (entry.LocalTokens?.Count > 0)
+            {
+                localTokens = new();
+
+                foreach ((string rawKey, string? value) in entry.LocalTokens)
+                {
+                    string name = rawKey.Trim();
+
+                    if (this.ReservedLocalTokenNames.Contains(name))
+                        return TrackSkip($"the {nameof(entry.LocalTokens)} field can't contain a token named '{name}', which is a reserved token name.");
+
+                    if (!tokenParser.TryParseNullableString(value, immutableRequiredModIDs, path.With(nameof(entry.LocalTokens), name), out string? error, out IManagedTokenString? parsed))
+                        return TrackSkip(error);
+
+                    if (parsed != null)
+                        localTokens.Add(name, parsed);
+                }
             }
 
             // parse 'enabled'
@@ -419,14 +486,6 @@ internal class PatchLoader
             UpdateRate updateRate;
             {
                 if (!this.TryParseUpdateRate(entry.Update, out updateRate, out string? error))
-                    return TrackSkip(error);
-            }
-
-            // parse 'from file'
-            IManagedTokenString? fromAsset = null;
-            if (entry.FromFile != null)
-            {
-                if (!this.TryPrepareLocalAsset(entry.FromFile, tokenParser, immutableRequiredModIDs, path.With(nameof(entry.FromFile)), out string? error, out fromAsset))
                     return TrackSkip(error);
             }
 
@@ -464,6 +523,8 @@ internal class PatchLoader
                             conditions: conditions,
                             fromFile: fromAsset,
                             updateRate: updateRate,
+                            inheritedLocalTokens: inheritLocalTokens,
+                            localTokens: localTokens,
                             contentPack: rawContentPack,
                             parentPatch: parentPatch,
                             parseAssetName: this.ParseAssetName,
@@ -492,6 +553,8 @@ internal class PatchLoader
                             assetLocale: targetAssetLocale,
                             priority: priority,
                             updateRate: updateRate,
+                            inheritedLocalTokens: inheritLocalTokens,
+                            localTokens: localTokens,
                             conditions: conditions,
                             localAsset: fromAsset,
                             contentPack: pack,
@@ -558,6 +621,8 @@ internal class PatchLoader
                             textOperations: textOperations,
                             targetField: targetField,
                             updateRate: updateRate,
+                            inheritedLocalTokens: inheritLocalTokens,
+                            localTokens: localTokens,
                             contentPack: pack,
                             migrator: rawContentPack.Migrator,
                             parentPatch: parentPatch,
@@ -602,6 +667,8 @@ internal class PatchLoader
                             assetLocale: targetAssetLocale,
                             priority: priority,
                             conditions: conditions,
+                            inheritedLocalTokens: inheritLocalTokens,
+                            localTokens: localTokens,
                             fromAsset: fromAsset,
                             fromArea: fromArea,
                             toArea: toArea,
@@ -747,6 +814,8 @@ internal class PatchLoader
                             addWarps: addWarps,
                             textOperations: textOperations,
                             updateRate: updateRate,
+                            inheritedLocalTokens: inheritLocalTokens,
+                            localTokens: localTokens,
                             contentPack: pack,
                             migrator: rawContentPack.Migrator,
                             parentPatch: parentPatch,
@@ -792,6 +861,17 @@ internal class PatchLoader
         {
             return TrackSkip($"error reading info. Technical details:\n{ex}");
         }
+    }
+
+    /// <summary>Pre-validate a token used in a patch's <see cref="PatchConfig.FromFile"/> or <see cref="PatchConfig.Target"/> field.</summary>
+    /// <param name="fieldName">The field name being validated.</param>
+    /// <param name="lexToken">The token to validate.</param>
+    /// <param name="prohibitedTokens">The token names which can't be used in the field.</param>
+    private string? PreValidateFromFileOrTargetToken(string fieldName, LexTokenToken lexToken, HashSet<string>? prohibitedTokens)
+    {
+        return prohibitedTokens?.Contains(lexToken.Name) is true
+            ? $"'{lexToken.Name}' is a non-inherited local token, which can't be used in the {fieldName} field."
+            : null;
     }
 
     /// <summary>Parse the priority field for a patch.</summary>
@@ -1398,8 +1478,9 @@ internal class PatchLoader
     /// <param name="logPath">The path to the value from the root content file.</param>
     /// <param name="error">The error reason if preparing the asset fails.</param>
     /// <param name="tokenedPath">The parsed value.</param>
+    /// <param name="preValidate">Validate a token used in the string after it's been parsed, but before the normal validation is applied. This can return an error string to fail validation, or <c>null</c> to continue with the default validation.</param>
     /// <returns>Returns whether the local asset was successfully prepared.</returns>
-    private bool TryPrepareLocalAsset(string? path, TokenParser tokenParser, IInvariantSet assumeModIds, LogPathBuilder logPath, [NotNullWhen(false)] out string? error, [NotNullWhen(true)] out IManagedTokenString? tokenedPath)
+    private bool TryPrepareLocalAsset(string? path, TokenParser tokenParser, IInvariantSet assumeModIds, LogPathBuilder logPath, [NotNullWhen(false)] out string? error, [NotNullWhen(true)] out IManagedTokenString? tokenedPath, Func<LexTokenToken, string?>? preValidate = null)
     {
         // normalize raw value
         path = path?.Trim();
@@ -1411,7 +1492,7 @@ internal class PatchLoader
         }
 
         // tokenize
-        if (!tokenParser.TryParseString(path, assumeModIds, logPath, out string? tokenError, out tokenedPath))
+        if (!tokenParser.TryParseString(path, assumeModIds, logPath, out string? tokenError, out tokenedPath, preValidate))
         {
             error = $"the {nameof(PatchConfig.FromFile)} is invalid: {tokenError}";
             tokenedPath = null;

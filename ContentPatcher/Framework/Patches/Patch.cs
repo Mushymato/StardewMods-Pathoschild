@@ -32,8 +32,28 @@ internal abstract class Patch : IPatch
     /// <summary>Diagnostic info about the instance.</summary>
     protected readonly ContextualState State = new();
 
-    /// <summary>The context which provides tokens specific to this patch like <see cref="ConditionType.Target"/>.</summary>
-    private readonly LocalContext PrivateContext;
+    /// <summary>The context which contains automatic patch-specific tokens like <see cref="ConditionType.Target"/>.</summary>
+    /// <remarks>
+    ///   Each patch has four layers of tokens, in order of priority:
+    ///
+    ///   <list type="number">
+    ///     <item>Local tokens defined directly on this patch (<see cref="CustomLocalTokensContext"/>). Changes to these tokens are treated as changes to the patch. These can be used in any field except <see cref="FromAsset"/> and <see cref="TargetAsset"/>.</item>
+    ///     <item>Local tokens inherited from a parent patch (<see cref="InheritedLocalTokensContext"/>). Changes to these tokens are treated as changes to the patch. These can be used in any field, including <see cref="FromAsset"/> and <see cref="TargetAsset"/>.</item>
+    ///     <item>Automatic patch tokens derived from the patch fields (<see cref="PatchFieldTokensContext"/>). For example, this includes <see cref="ConditionType.FromFile"/>.</item>
+    ///     <item>Tokens from the main context (passed in via <see cref="UpdateContext"/>).</item>
+    ///   </list>
+    ///
+    ///   These are separate to allow for the specific update order needed. For example, inherited local tokens can be used in <see cref="FromAsset"/>, which must be updated before custom local tokens can be updated.
+    /// </remarks>
+    private readonly LocalContext PatchFieldTokensContext;
+
+    /// <summary>The context which contains custom <see cref="LocalTokens"/> defined for this patch, if applicable.</summary>
+    /// <inheritdoc cref="PatchFieldTokensContext" path="/remarks" />
+    private readonly LocalContext? CustomLocalTokensContext;
+
+    /// <summary>The context which contains custom <see cref="LocalTokens"/> inherited from the parent patch, if applicable.</summary>
+    /// <inheritdoc cref="PatchFieldTokensContext" path="/remarks" />
+    private readonly LocalContext? InheritedLocalTokensContext;
 
     /// <summary>Whether the <see cref="FromAsset"/> file exists.</summary>
     private bool FromAssetExistsImpl;
@@ -57,6 +77,13 @@ internal abstract class Patch : IPatch
 
     /// <summary>The cached result for <see cref="GetTokensUsed"/>.</summary>
     protected IInvariantSet? TokensUsedCache;
+
+    /// <summary>The local token values defined on this patch (excluding inherited local tokens), in addition to the pre-existing tokens.</summary>
+    protected InvariantDictionary<IManagedTokenString>? LocalTokens { get; }
+
+    /// <summary>Whether this patch has any <see cref="LocalTokens"/> defined.</summary>
+    [MemberNotNullWhen(true, nameof(Patch.LocalTokens), nameof(Patch.CustomLocalTokensContext), nameof(Patch.InheritedLocalTokensContext))]
+    protected bool HasLocalTokens { get; }
 
 
     /*********
@@ -116,9 +143,6 @@ internal abstract class Patch : IPatch
     /// <inheritdoc />
     public bool IsApplied { get; set; }
 
-    /// <inheritdoc />
-    public int LastChangedTick { get; protected set; }
-
 
     /*********
     ** Public methods
@@ -135,23 +159,47 @@ internal abstract class Patch : IPatch
         this.State.Reset();
         bool isReady = true;
 
-        // update local tokens
+        // update built-in local tokens
         // (FromFile and Target may reference each other, so they need to be updated in a
         // specific order. A circular reference isn't possible since that's checked when the
         // patch is loaded.)
-        this.PrivateContext.Update(context);
         bool changed = false;
-        if (this.ManagedRawTargetAsset?.UsesTokens(InternalConstants.FromFileTokens) == true)
-            changed |= this.UpdateFromFile(this.PrivateContext) | this.UpdateTargetPath(this.PrivateContext);
-        else
-            changed |= this.UpdateTargetPath(this.PrivateContext) | this.UpdateFromFile(this.PrivateContext);
-        isReady &= this.RawTargetAsset?.IsReady != false && this.RawFromAsset?.IsReady != false;
+        {
+            this.PatchFieldTokensContext.Update(context);
+            this.InheritedLocalTokensContext?.UpdateParentContextLinkOnly(this.PatchFieldTokensContext);
+
+            LocalContext useContext = this.InheritedLocalTokensContext ?? this.PatchFieldTokensContext;
+
+            if (this.ManagedRawTargetAsset?.UsesTokens(InternalConstants.FromFileTokens) == true)
+                changed |= this.UpdateFromFile(useContext) | this.UpdateTargetPath(useContext);
+            else
+                changed |= this.UpdateTargetPath(useContext) | this.UpdateFromFile(useContext);
+
+            isReady &= this.RawTargetAsset?.IsReady != false && this.RawFromAsset?.IsReady != false;
+        }
+
+        // update user-defined local tokens
+        // NOTE: these tokens are patch-specific, so we need to update the tokens ourselves to track any changes to the
+        // token as a change to the patch. There's no need to update inherited tokens, since they'll be updated by the
+        // parent patch and their changes will be detected when we update the field or local token using them.
+        if (this.HasLocalTokens)
+        {
+            foreach ((string key, IManagedTokenString value) in this.LocalTokens)
+            {
+                changed |= value.UpdateContext(context);
+                this.CustomLocalTokensContext.SetLocalValue(key, value, value.IsReady);
+            }
+
+            this.CustomLocalTokensContext.UpdateParentContextLinkOnly(this.InheritedLocalTokensContext);
+        }
 
         // update contextuals
         if (isReady)
         {
+            IContext useContext = this.CustomLocalTokensContext ?? this.PatchFieldTokensContext;
+
             changed |= this.Contextuals.UpdateContext(
-                this.PrivateContext,
+                useContext,
                 update: p => !this.ManuallyUpdatedTokens.Contains(p),
 
                 // This avoids propagating irrelevant changes. For example, consider this condition:
@@ -231,13 +279,15 @@ internal abstract class Patch : IPatch
     /// <param name="assetLocale">The locale code in the target asset's name to match. See <see cref="IPatch.TargetAsset"/> for more info.</param>
     /// <param name="priority">The priority for this patch when multiple patches apply.</param>
     /// <param name="updateRate">When the patch should be updated.</param>
+    /// <param name="inheritedLocalTokens">The local token values inherited from the parent patch if applicable, to use in addition to the pre-existing tokens.</param>
+    /// <param name="localTokens">The local token values defined directly on this patch, to use in addition to the pre-existing tokens.</param>
     /// <param name="conditions">The conditions which determine whether this patch should be applied.</param>
-    /// <param name="parseAssetName">Parse an asset name.</param>
     /// <param name="contentPack">The content pack which requested the patch.</param>
     /// <param name="migrator">The aggregate migration which applies for this patch.</param>
     /// <param name="parentPatch">The parent <see cref="PatchType.Include"/> patch for which this patch was loaded, if any.</param>
+    /// <param name="parseAssetName">Parse an asset name.</param>
     /// <param name="fromAsset">The normalized asset key from which to load the local asset (if applicable), including tokens.</param>
-    protected Patch(int[] indexPath, LogPathBuilder path, PatchType type, IManagedTokenString? assetName, IManagedTokenString? assetLocale, int priority, UpdateRate updateRate, IEnumerable<Condition> conditions, IContentPack contentPack, IRuntimeMigration migrator, IPatch? parentPatch, Func<string, IAssetName> parseAssetName, IManagedTokenString? fromAsset = null)
+    protected Patch(int[] indexPath, LogPathBuilder path, PatchType type, IManagedTokenString? assetName, IManagedTokenString? assetLocale, int priority, UpdateRate updateRate, InvariantDictionary<IManagedTokenString>? inheritedLocalTokens, InvariantDictionary<IManagedTokenString>? localTokens, IEnumerable<Condition> conditions, IContentPack contentPack, IRuntimeMigration migrator, IPatch? parentPatch, Func<string, IAssetName> parseAssetName, IManagedTokenString? fromAsset = null)
     {
         this.IndexPath = indexPath;
         this.Path = path;
@@ -248,7 +298,7 @@ internal abstract class Patch : IPatch
         this.UpdateRate = updateRate;
         this.Conditions = conditions.ToArray();
         this.ParseAssetNameImpl = parseAssetName;
-        this.PrivateContext = new LocalContext(scope: contentPack.Manifest.UniqueID);
+        this.PatchFieldTokensContext = new LocalContext(scope: contentPack.Manifest.UniqueID);
         this.ManagedRawFromAsset = fromAsset;
         this.ContentPack = contentPack;
         this.Migrator = migrator;
@@ -265,6 +315,35 @@ internal abstract class Patch : IPatch
             this.ManuallyUpdatedTokens.Add(assetLocale);
         if (fromAsset != null)
             this.ManuallyUpdatedTokens.Add(fromAsset);
+
+        if (localTokens != null || inheritedLocalTokens != null)
+        {
+            this.LocalTokens = localTokens ?? new();
+
+            this.CustomLocalTokensContext = new LocalContext(scope: contentPack.Manifest.UniqueID);
+            this.InheritedLocalTokensContext = new LocalContext(scope: contentPack.Manifest.UniqueID);
+            this.HasLocalTokens = true;
+
+            if (localTokens != null)
+            {
+                foreach ((string key, IManagedTokenString value) in localTokens)
+                {
+                    this.CustomLocalTokensContext.SetLocalValue(key, value, value.IsReady);
+                    this.Contextuals.Add(value);
+                    this.ManuallyUpdatedTokens.Add(value);
+                }
+            }
+
+            if (inheritedLocalTokens != null)
+            {
+                foreach ((string key, IManagedTokenString value) in inheritedLocalTokens)
+                {
+                    this.InheritedLocalTokensContext.SetLocalValue(key, value, value.IsReady);
+                    this.Contextuals.Add(value);
+                    this.ManuallyUpdatedTokens.Add(value);
+                }
+            }
+        }
     }
 
     /// <summary>Track that the patch values were updated.</summary>
