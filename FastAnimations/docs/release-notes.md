@@ -1,6 +1,11 @@
 ﻿[← back to readme](README.md)
 
 # Release notes
+## 1.15.0
+Released 06 June 2025 for SMAPI 4.1.10 or later.
+
+* Added support for fishing minigame text like `HIT!` (thanks to jltaylor-us!).
+
 ## 1.14.1
 Released 27 May 2025 for SMAPI 4.1.10 or later.
 
